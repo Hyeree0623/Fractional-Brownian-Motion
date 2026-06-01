@@ -1,0 +1,369 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import argparse
+
+# ============================================================
+# Robust LAMMPS dump reader (NUMBER OF ATOMS, BOX BOUNDS tilt, 2D/3D)
+# Returns per frame:
+#   (timestep, (xlo,xhi,ylo,yhi,zlo,zhi), atoms_dict, use_min_image)
+# where atoms_dict: id -> (x, y, z or None)
+# use_min_image = False if positions are already unwrapped (xu/yu/zu)
+# ============================================================
+
+def parse_lammps_dump(path: str):
+    """Yield (timestep, bounds6, atoms_dict, use_min_image) per frame."""
+    def rl(f):
+        s = f.readline()
+        return None if not s else s.rstrip("\r\n")
+
+    with open(path, "r") as f:
+        look = None  # lookahead line holder
+
+        def next_line():
+            nonlocal look
+            if look is not None:
+                s, look = look, None
+                return s
+            return rl(f)
+
+        while True:
+            line = next_line()
+            if line is None:
+                break
+            if not line.startswith("ITEM: TIMESTEP"):
+                continue
+
+            ts_line = next_line()
+            if ts_line is None:
+                break
+            ts = int(ts_line)
+
+            # Optional NUMBER OF ATOMS
+            line = next_line()
+            if line is None:
+                break
+            if line.startswith("ITEM: NUMBER OF ATOMS"):
+                _ = next_line()  # count line (not used)
+                line = next_line()
+
+            # BOX BOUNDS (triclinic variants allowed)
+            if line is None or not line.startswith("ITEM: BOX BOUNDS"):
+                raise ValueError("Missing 'ITEM: BOX BOUNDS' after TIMESTEP")
+
+            bounds_pairs = []
+            for _ in range(3):  # try to read up to 3 lines of bounds
+                p = next_line()
+                if (p is None) or p.startswith("ITEM: "):
+                    # push header back for next stage
+                    look = p
+                    break
+                parts = p.split()
+                if len(parts) < 2:
+                    raise ValueError("Unexpected BOX BOUNDS numeric line")
+                bounds_pairs.append((float(parts[0]), float(parts[1])))
+
+            if len(bounds_pairs) >= 3:
+                (xlo, xhi), (ylo, yhi), (zlo, zhi) = bounds_pairs[:3]
+            elif len(bounds_pairs) == 2:
+                (xlo, xhi), (ylo, yhi) = bounds_pairs
+                zlo, zhi = 0.0, 0.0
+            else:
+                raise ValueError("Could not parse BOX BOUNDS")
+
+            # ATOMS header
+            line = next_line()
+            if line is None or not line.startswith("ITEM: ATOMS"):
+                raise ValueError("Missing 'ITEM: ATOMS' header")
+            cols = line.split()[2:]
+            cidx = {c: i for i, c in enumerate(cols)}
+            if "id" not in cidx:
+                raise ValueError("'id' column not found in ATOMS header")
+
+            # Choose coordinate accessors & whether to use min-image
+            use_min_image = True
+
+            def s2r(s, lo, hi):
+                return lo + float(s) * (hi - lo)
+
+            if "xu" in cidx or "yu" in cidx or "zu" in cidx:
+                # Prefer unwrapped if present
+                get_x = (lambda a: float(a[cidx["xu"]])) if "xu" in cidx else None
+                get_y = (lambda a: float(a[cidx["yu"]])) if "yu" in cidx else None
+                get_z = (lambda a: float(a[cidx["zu"]])) if "zu" in cidx else None
+                use_min_image = False
+            elif "x" in cidx or "y" in cidx or "z" in cidx:
+                get_x = (lambda a: float(a[cidx["x"]])) if "x" in cidx else None
+                get_y = (lambda a: float(a[cidx["y"]])) if "y" in cidx else None
+                get_z = (lambda a: float(a[cidx["z"]])) if "z" in cidx else None
+                use_min_image = True
+            elif "xs" in cidx or "ys" in cidx or "zs" in cidx:
+                get_x = (lambda a: s2r(a[cidx["xs"]], xlo, xhi)) if "xs" in cidx else None
+                get_y = (lambda a: s2r(a[cidx["ys"]], ylo, yhi)) if "ys" in cidx else None
+                get_z = (lambda a: s2r(a[cidx["zs"]], zlo, zhi)) if "zs" in cidx else None
+                use_min_image = True
+            else:
+                raise ValueError("No usable position columns (x/xu/xs etc.)")
+
+            atoms = {}
+            while True:
+                pos = rl(f)
+                if (pos is None) or pos.startswith("ITEM: "):
+                    look = pos
+                    break
+                parts = pos.split()
+                aid = int(parts[cidx["id"]])
+                xv = get_x(parts) if get_x else None
+                yv = get_y(parts) if get_y else None
+                zv = get_z(parts) if get_z else None
+                atoms[aid] = (xv, yv, zv)
+
+            yield ts, (xlo, xhi, ylo, yhi, zlo, zhi), atoms, use_min_image
+
+
+# ============================================================
+# Build stacked coordinate matrix X: (M, T) for chosen ids, axis, unwrap
+# ============================================================
+
+def build_stacked_X(path, ids=None, id_min=None, axis="x", min_coverage=0.95):
+    """
+    ids: list of ints to include (exclusive with id_min). If None and id_min given, include >= id_min.
+    axis: "x"|"y"|"z"
+    Returns: X (M,T), boxes_lengths (T,), used_ids (list[int]), use_min_image (bool)
+    """
+    assert axis in ("x", "y", "z")
+    aidx = {"x": 0, "y": 1, "z": 2}[axis]
+
+    frames = []            # list of dict: id -> coord (selected axis)
+    L_axis = []            # box length along axis
+    used_ids_set = set()
+    global_use_min_image = None
+
+    for ts, (xlo, xhi, ylo, yhi, zlo, zhi), atoms, use_min_image in parse_lammps_dump(path):
+        if global_use_min_image is None:
+            global_use_min_image = bool(use_min_image)
+        # collect this frame
+        frame = {}
+        for aid, (xv, yv, zv) in atoms.items():
+            if ids is not None:
+                if aid not in ids:
+                    continue
+            elif id_min is not None:
+                if aid < id_min:
+                    continue
+            coord = (xv if aidx == 0 else yv if aidx == 1 else zv)
+            if coord is not None:
+                frame[aid] = float(coord)
+                used_ids_set.add(aid)
+        if frame:
+            frames.append(frame)
+            L = (xhi - xlo) if aidx == 0 else (yhi - ylo) if aidx == 1 else (zhi - zlo)
+            L_axis.append(L)
+
+    if not frames:
+        raise ValueError("No coordinates found for the selection.")
+
+    used_ids = sorted(list(used_ids_set))
+    T = len(frames)
+    M = len(used_ids)
+
+    # unwrap per id along selected axis
+    X = np.full((M, T), np.nan, float)
+    prev = {aid: None for aid in used_ids}
+    unwrapped = {aid: 0.0 for aid in used_ids}
+
+    for t, (frame, L) in enumerate(zip(frames, L_axis)):
+        for m, aid in enumerate(used_ids):
+            if aid in frame:
+                x = frame[aid]
+                if prev[aid] is None:
+                    prev[aid] = x
+                    unwrapped[aid] = x
+                    X[m, t] = x
+                else:
+                    dx = x - prev[aid]
+                    if global_use_min_image and L > 0:
+                        if dx > 0.5 * L:
+                            dx -= L
+                        elif dx < -0.5 * L:
+                            dx += L
+                    unwrapped[aid] += dx
+                    prev[aid] = x
+                    X[m, t] = unwrapped[aid]
+            # else remains NaN
+
+    # filter rows by coverage
+    keep = []
+    for m in range(M):
+        ok = np.isfinite(X[m]).mean()
+        if ok >= min_coverage:
+            keep.append(m)
+    if not keep:
+        raise ValueError("No trajectories passed min_coverage filter.")
+    X = X[keep]
+    used_ids = [used_ids[m] for m in keep]
+
+    # small forward/back fill to align for increment calc
+    for m in range(X.shape[0]):
+        row = X[m]
+        if not np.all(np.isfinite(row)):
+            good = np.where(np.isfinite(row))[0]
+            if good.size == 0:
+                continue
+            row[:good[0]] = row[good[0]]
+            for i in range(1, len(good)):
+                # fill the gap strictly between two good indices
+                if good[i-1] + 1 <= good[i] - 1:
+                    row[good[i-1] + 1 : good[i]] = row[good[i-1]]
+            row[good[-1] + 1 :] = row[good[-1]]
+            X[m] = row
+
+    return X, np.array(L_axis, float), used_ids, bool(global_use_min_image)
+
+
+# ============================================================
+# Quantile lines on increments across particles (per time index)
+# ============================================================
+
+def quantile_lines_on_increments(X, q_list=(1,5,10,25,50,75,90,95,99), smooth_w=None):
+    """
+    X: (M,T) stacked unwrapped positions.
+    Returns: Q (len(q), T-1) and qs (fractions).
+    """
+    dX = X[:, 1:] - X[:, :-1]  # (M, T-1)
+    M, Tm1 = dX.shape
+    qs = np.array(q_list, float) / 100.0
+
+    Q = np.full((len(qs), Tm1), np.nan, float)
+    for t in range(Tm1):
+        col = dX[:, t]
+        col = col[np.isfinite(col)]
+        if col.size >= max(10, int(0.2 * M)):  # require enough samples
+            Q[:, t] = np.quantile(col, qs)
+
+    if (smooth_w is not None) and (smooth_w > 1):
+        k = int(smooth_w)
+        for i in range(Q.shape[0]):
+            y = Q[i]
+            mask = np.isfinite(y)
+            if mask.sum() < k:
+                continue
+            # moving average on the finite subsequence
+            seq = y[mask]
+            seq_pad = np.pad(seq, (k-1, k-1), mode='edge')
+            kernel = np.ones(k) / k
+            y_s = np.convolve(seq_pad, kernel, mode='valid')
+            Q[i, mask] = y_s[: mask.sum()]
+    return Q, qs
+
+
+def plot_quantile_lines(Q, qs, dt=1.0, out="quantile_lines.pdf"):
+    """
+    Plot each row of Q vs time with no labels/legend.
+    Q: array-like with shape (num_quantiles, T)
+    """
+    Q = np.asarray(Q)
+    Tm1 = Q.shape[1]
+    time = np.arange(1, Tm1 + 1) * float(dt)  # physical time axis
+
+    plt.figure(figsize=(10.5, 6))
+
+    for i in range(Q.shape[0]):
+        y = Q[i]
+        ok = np.isfinite(y)
+        if not np.any(ok):
+            continue
+        plt.plot(time[ok], y[ok], linewidth=1.8)
+
+    plt.xlabel("t", fontsize=30)
+    plt.ylabel("Quantile", fontsize=30)
+    plt.xticks(fontsize=20)
+    plt.yticks(fontsize=20)
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+    print(f"[saved] {out}")
+
+
+# ============================================================
+# Driver
+# ============================================================
+
+def run(args):
+    # id selection
+    ids = None
+    if args.id_start is not None and args.id_end is not None and args.id_min is None:
+        ids = list(range(args.id_start, args.id_end + 1))
+        id_desc = f"ids {args.id_start}-{args.id_end}"
+    elif args.id_min is not None:
+        id_desc = f"ids >= {args.id_min}"
+    else:
+        raise ValueError("Provide either --id_start/--id_end or --id_min")
+
+    print(f"[*] Reading {args.dump}; axis={args.axis}; using {id_desc}")
+    X, Laxis, used_ids, use_min_image = build_stacked_X(
+        args.dump,
+        ids=ids,
+        id_min=args.id_min,
+        axis=args.axis,
+        min_coverage=args.min_coverage
+    )
+    print(f"    X shape: {X.shape} (M,T); used {len(used_ids)} ids; min-image={use_min_image}")
+
+    Q, qs = quantile_lines_on_increments(
+        X,
+        q_list=args.quantiles,
+        smooth_w=args.smooth_window
+    )
+
+    out = args.out or f"quantile_lines_{args.axis}.pdf"
+    plot_quantile_lines(Q, qs, dt=args.dt, out=out)
+
+
+# ============================================================
+# CLI / Jupyter entry
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    in_ipykernel = ("ipykernel" in sys.argv[0]) or any(a.startswith("-f") for a in sys.argv[1:])
+
+    if in_ipykernel:
+        class Args: pass
+        args = Args()
+        args.dump = "dump.lammpstrj"    # <-- your file
+        args.axis = "x"                      # "x"|"y"|"z"
+        # choose one of the two selection modes:
+        args.id_start, args.id_end = 2501, 5000   # analyze ids 2501–5000
+        args.id_min = None                        # (or set to 2001 to use >=2001)
+        args.min_coverage = 0.95
+        args.quantiles = [1,5,10,25,50,75,90,95,99]
+        args.smooth_window = 11      # moving-average window (odd int), or None/1 for no smoothing
+        args.dt = 1.0                # physical time between frames
+        args.out = "quantile_lines.pdf"
+        run(args)
+    else:
+        p = argparse.ArgumentParser(description="Plot quantile lines of increments across time")
+        p.add_argument("--dump", type=str, required=True, help="Path to LAMMPS dump")
+        p.add_argument("--axis", type=str, default="x", choices=["x", "y", "z"])
+        # selection: either a range or a minimum id
+        p.add_argument("--id_start", type=int, default=None, help="Start id (inclusive)")
+        p.add_argument("--id_end", type=int, default=None, help="End id (inclusive)")
+        p.add_argument("--id_min", type=int, default=None, help="Use all ids >= this (overrides range if set)")
+        p.add_argument("--min_coverage", type=float, default=0.95, help="Min non-NaN fraction per trajectory")
+        p.add_argument("--quantiles", type=float, nargs="+",
+                       default=[1,5,10,25,50,75,90,95,99], help="Quantiles in percent")
+        p.add_argument("--smooth_window", type=int, default=11,
+                       help="Moving-average window for visual smoothing (set 1 or 0 to disable)")
+        p.add_argument("--dt", type=float, default=1.0, help="Physical time between frames")
+        p.add_argument("--out", type=str, default=None, help="Output figure filename (PDF/PNG etc.)")
+        args = p.parse_args()
+
+        # normalize smoothing
+        if args.smooth_window is not None and args.smooth_window <= 1:
+            args.smooth_window = None
+
+        # validate selection
+        if args.id_min is None and (args.id_start is None or args.id_end is None):
+            p.error("Provide either --id_start and --id_end, or --id_min")
+
+        run(args)
