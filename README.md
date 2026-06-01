@@ -2,6 +2,7 @@
 Analysis code to determine wheter systems show FBM behavior 
 
 ## Usage
+p-variation test
 1. Open the notebook in Jupyter Lab or Jupyter Notebook.
 2. Modify the parameters in the `args` section:
    - Input file name
@@ -11,3 +12,8 @@ Analysis code to determine wheter systems show FBM behavior
    - p-variation parameters
 3. Run all cells.
 4. Review the generated p-variation results and plots.
+
+
+Gaussian test
+
+
