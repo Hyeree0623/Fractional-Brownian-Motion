@@ -30,4 +30,13 @@ Hurst Index     JB/KS Analysis
          ↓
 FBM Characterization
 
+## Applications
+
+- Fractional Brownian motion (FBM)
+- Active Brownian particles (ABP)
+- Molecular dynamics simulations
+- Single-particle tracking
+- Anomalous diffusion
+- Heterogeneous transport
+- Statistical characterization of trajectories
 
