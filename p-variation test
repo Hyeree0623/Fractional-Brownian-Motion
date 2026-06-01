@@ -1,0 +1,295 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import argparse
+
+# ============================================================
+# --- Simplified utilities for your p-variation analysis ---
+# ============================================================
+
+def read_lammps_dump(path, use_unwrapped=True, id_min=1, id_max=None, dims=2):
+    times, boxes, pos_records = [], [], []
+    used_unwrapped = False
+
+    def _read_box_bounds(f, dims):
+        bounds = []
+        for _ in range(3):
+            pos = f.tell()
+            l = f.readline()
+            if not l or l.startswith("ITEM: "):
+                f.seek(pos); break
+            parts = l.strip().split()
+            if len(parts) < 2:
+                f.seek(pos); break
+            lo, hi = float(parts[0]), float(parts[1])
+            bounds.append([lo, hi])
+            if len(bounds) == 2 and dims == 2:
+                break
+        if len(bounds) == 2: bounds.append([0.0, 0.0])
+        return [[bounds[0][0], bounds[0][1]],
+                [bounds[1][0], bounds[1][1]],
+                [bounds[2][0], bounds[2][1]]]
+
+    with open(path, "r") as f:
+        while True:
+            line = f.readline()
+            if not line: break
+            if not line.startswith("ITEM: TIMESTEP"): continue
+
+            ts_line = f.readline()
+            if not ts_line: break
+            times.append(int(ts_line.strip()))
+
+            frame_box = None
+            atoms_header = None
+            while True:
+                pos = f.tell()
+                hdr = f.readline()
+                if not hdr: break
+                hdr = hdr.strip()
+                if not hdr.startswith("ITEM: "): continue
+                if hdr.startswith("ITEM: NUMBER OF ATOMS"):
+                    _ = f.readline(); continue
+                if hdr.startswith("ITEM: BOX BOUNDS"):
+                    frame_box = _read_box_bounds(f, dims); continue
+                if hdr.startswith("ITEM: ATOMS"):
+                    atoms_header = hdr; break
+
+            if frame_box is None:
+                frame_box = [[0, 0], [0, 0], [0, 0]]
+            boxes.append(frame_box)
+
+            cols = atoms_header.split()[2:]
+            colset = set(cols)
+            need_unwrap_cols = {"xu","yu"} | ({"zu"} if dims==3 else set())
+            if use_unwrapped and need_unwrap_cols.issubset(colset):
+                used_unwrapped = True
+
+            data = {}
+            while True:
+                pos = f.tell()
+                l = f.readline()
+                if (not l) or l.startswith("ITEM: "):
+                    f.seek(pos); break
+
+                parts = l.split()
+                rec = dict(zip(cols, parts))
+                pid = int(rec["id"])
+
+                # --- keep only requested IDs ---
+                if pid < id_min:
+                    continue
+                if (id_max is not None) and (pid > id_max):
+                    continue
+
+                if used_unwrapped:
+                    x = float(rec["xu"]); y = float(rec["yu"])
+                    z = float(rec["zu"]) if dims==3 else 0.0
+                else:
+                    x = float(rec["x"]); y = float(rec["y"])
+                    z = float(rec["z"]) if dims==3 else 0.0
+
+                # --- BUGFIX: use pid key directly ---
+                data[pid] = (x, y, z)
+
+            pos_records.append(data)
+
+    all_ids = sorted({pid for d in pos_records for pid in d.keys()})
+    T = len(pos_records)
+    D = dims
+    traj = {pid: np.full((T,D), np.nan) for pid in all_ids}
+    for t, d in enumerate(pos_records):
+        for pid, (x,y,z) in d.items():
+            traj[pid][t,0], traj[pid][t,1] = x, y
+            if D==3: traj[pid][t,2] = z
+    return np.array(times), np.array(boxes), traj, used_unwrapped
+
+
+def unwrap_minimum_image(positions, box_bounds):
+    pos = positions.copy()
+    T, D = pos.shape
+    for d in range(D):
+        L = box_bounds[:,d,1] - box_bounds[:,d,0]
+        jumps = np.diff(pos[:,d])
+        shifts = np.rint(jumps / (L[1:] + 1e-15)) * L[1:]
+        pos[1:,d] -= np.cumsum(shifts)
+    return pos
+
+
+def stack_axis(traj_dict, axis=0, min_coverage=0.95, boxes=None, force_unwrap=False, only_id=None):
+    series = []
+    for pid, arr in traj_dict.items():
+        if (only_id is not None) and (pid != only_id):
+            continue
+
+        coords = unwrap_minimum_image(arr, boxes) if (force_unwrap and boxes is not None) else arr
+        x = coords[:,axis]
+        ok = np.isfinite(x)
+        if ok.mean() < min_coverage: 
+            continue
+
+        xi = x.copy()
+        if not np.all(ok):
+            good = np.where(ok)[0]
+            xi[:good[0]] = xi[good[0]]
+            for i in range(1, len(good)):
+                xi[good[i-1]:good[i]] = xi[good[i-1]]
+            xi[good[-1]:] = xi[good[-1]]
+        series.append(xi)
+
+    if not series:
+        raise ValueError("No usable trajectories.")
+    return np.vstack(series)
+
+
+# ============================================================
+# MSD and p-variation functions
+# ============================================================
+
+def msd_time_avg(X, max_lag=None):
+    M, T = X.shape
+    if max_lag is None: max_lag = T//2
+    msd = np.zeros(max_lag)
+    for tau in range(1, max_lag+1):
+        diffs = X[:, tau:] - X[:, :-tau]
+        msd[tau-1] = np.mean(diffs**2)
+    lags = np.arange(1, max_lag+1)
+    return lags, msd
+
+def fit_loglog_slope(x, y, min_x=2):
+    mask = (y>0) & (x>=min_x)
+    X = np.log(x[mask]); Y = np.log(y[mask])
+    if len(X) < 2: return np.nan, np.nan
+    slope, intercept = np.polyfit(X, Y, 1)
+    return slope, intercept
+
+def p_variation_single(z, p, m_values=(1,2,4,8,16,32,64)):
+    z = np.asarray(z)
+    T = len(z)
+    ms = np.array(sorted(set(int(m) for m in m_values if m>=1)))
+    V = np.full(ms.shape, np.nan)
+    for i, m in enumerate(ms):
+        K = T // m
+        if K < 2: continue
+        idx0, idx1 = m*np.arange(0, K-1), m*np.arange(1, K)
+        diffs = z[idx1] - z[idx0]
+        V[i] = np.sum(np.abs(diffs)**p)
+    return ms, V
+
+def p_variation_multi(Z, p, m_values=(1,2,4,8,16,32,64), reduce="mean"):
+    Z = np.asarray(Z)
+    ms = np.array(sorted(set(int(m) for m in m_values if m>=1)))
+    M, T = Z.shape
+    V_all = np.full((M, len(ms)), np.nan)
+    for i in range(M):
+        _, V_i = p_variation_single(Z[i], p, m_values=ms)
+        V_all[i] = V_i
+    if reduce == "mean": return ms, np.nanmean(V_all, axis=0)
+    if reduce == "median": return ms, np.nanmedian(V_all, axis=0)
+    return ms, V_all
+
+
+# ============================================================
+# Plot three curves for H±0.1
+# ============================================================
+def plot_three_H(Z, H_ref, delta=0.1, m_values=(1,2,4,8,16,32,64),
+                 reduce="mean", out="pvariation_three_H.pdf"):
+    plt.figure(figsize=(8, 6))
+
+    Hs = [max(H_ref - delta, 1e-6), H_ref, H_ref + delta]
+    colors = ["#D62728", "#1F77B4", "#FF7F0E"]
+    labels = [f"H={Hs[0]:.2f}", f"H={Hs[1]:.2f}", f"H={Hs[2]:.2f}"]
+
+    for H, lbl, c in zip(Hs, labels, colors):
+        p = 1.0 / H
+        ms, V = p_variation_multi(Z, p, m_values=m_values, reduce=reduce)
+        plt.loglog(ms, V, 'o-', label=lbl, color=c, linewidth=2)
+
+    plt.xlabel("m", fontsize=24)
+    plt.ylabel(r"$V_m^{(p)}$", fontsize=24)
+    plt.xticks(fontsize=19)
+    plt.yticks(fontsize=19)
+
+    ymin, ymax = plt.ylim()
+    plt.ylim(ymin, ymax * 8.5)
+
+    plt.legend(loc='upper right', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+
+# ============================================================
+# Runner
+# ============================================================
+
+def run(args):
+    target_id = 2501  # <<< ONLY THIS ATOM
+
+    print("[*] Reading dump:", args.dump)
+    times, boxes, traj, used_unwrapped = read_lammps_dump(
+        args.dump,
+        use_unwrapped=args.use_unwrapped,
+        id_min=target_id,
+        id_max=target_id,          # <<< only 2501
+        dims=args.dims
+    )
+
+    force_unwrap = (not used_unwrapped) and args.unwrap_if_needed
+    X = stack_axis(
+        traj, axis=args.axis, min_coverage=args.min_coverage,
+        boxes=boxes, force_unwrap=force_unwrap,
+        only_id=target_id          # <<< only 2501
+    )
+
+    if args.H_ref is None:
+        print("[*] Estimating H from MSD...")
+        lags, msd = msd_time_avg(X, max_lag=args.max_lag)
+        slope, _ = fit_loglog_slope(lags, msd)
+        H_ref = slope / 2.0
+        print(f"    Estimated H_ref = {H_ref:.3f}")
+    else:
+        H_ref = args.H_ref
+        print(f"[*] Using provided H_ref = {H_ref:.3f}")
+
+    m_values = tuple(int(s) for s in args.m_values.split(",") if s.strip())
+    print(f"[*] Plotting for H±{args.delta:.1f}")
+    plot_three_H(X, H_ref=H_ref, delta=args.delta, m_values=m_values,
+                 reduce="mean", out=args.out)
+    print(f"    Saved: {args.out}")
+
+
+# ============================================================
+# CLI / IPython-safe main
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    if any(a.startswith("-f") for a in sys.argv):  # running inside Jupyter
+        class Args: pass
+        args = Args()
+        args.dump = "dump.lammpstrj"
+        args.dims = 2
+        args.axis = 0
+        args.min_coverage = 0.95
+        args.use_unwrapped = True
+        args.unwrap_if_needed = True
+        args.max_lag = None
+        args.H_ref = None
+        args.delta = 0.1
+        args.m_values = "1,2,4,8,16,32,64,128"
+        args.out = "pvariation_three_H.pdf"
+        run(args)
+    else:
+        parser = argparse.ArgumentParser(description="Plot V_m^(p) vs m for H ± delta, p=1/H")
+        parser.add_argument("dump", help="Path to LAMMPS dump file")
+        parser.add_argument("--dims", type=int, default=2, choices=[2,3])
+        parser.add_argument("--axis", type=int, default=0)
+        parser.add_argument("--min_coverage", type=float, default=0.95)
+        parser.add_argument("--use_unwrapped", action="store_true")
+        parser.add_argument("--unwrap_if_needed", action="store_true")
+        parser.add_argument("--max_lag", type=int, default=None)
+        parser.add_argument("--H_ref", type=float, default=None)
+        parser.add_argument("--delta", type=float, default=0.1)
+        parser.add_argument("--m_values", type=str, default="1,2,4,8,16,32,64,128")
+        parser.add_argument("--out", type=str, default="pvariation_three_H.pdf")
+        args = parser.parse_args()
+        run(args)
