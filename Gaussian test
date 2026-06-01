@@ -1,0 +1,485 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import argparse
+from scipy import stats
+import csv
+
+
+# ----------------------------
+# Robust LAMMPS dump reader
+# ----------------------------
+def parse_lammps_dump(path: str):
+    def rl(f):
+        s = f.readline()
+        return None if not s else s.strip()
+
+    with open(path, "r") as f:
+        while True:
+            line = rl(f)
+            if line is None:
+                break
+            if not line.startswith("ITEM: TIMESTEP"):
+                continue
+
+            ts_line = rl(f)
+            if ts_line is None:
+                break
+            ts = int(ts_line)
+
+            line = rl(f)
+            # NUMBER OF ATOMS may or may not be present; tolerate both
+            if line is not None and line.startswith("ITEM: NUMBER OF ATOMS"):
+                _ = rl(f)  # count line
+                line = rl(f)
+
+            if line is None or not line.startswith("ITEM: BOX BOUNDS"):
+                raise ValueError("Missing 'ITEM: BOX BOUNDS'")
+
+            bounds = []
+            for _ in range(3):
+                p = rl(f)
+                if p is None or p.startswith("ITEM: "):
+                    # 2D case: only two lines; rewind header if we over-read
+                    if p is not None:
+                        f.seek(f.tell() - (len(p) + 1))
+                    break
+                parts = p.split()
+                # take lo, hi only (ignore tilts)
+                if len(parts) >= 2:
+                    bounds.extend([float(parts[0]), float(parts[1])])
+
+            if len(bounds) >= 6:
+                xlo, xhi, ylo, yhi, zlo, zhi = bounds[:6]
+            elif len(bounds) == 4:
+                xlo, xhi, ylo, yhi = bounds
+                zlo, zhi = 0.0, 0.0
+            else:
+                raise ValueError("Unexpected BOX BOUNDS format")
+
+            line = rl(f)
+            if line is None or not line.startswith("ITEM: ATOMS"):
+                raise ValueError("Missing 'ITEM: ATOMS'")
+            cols = line.split()[2:]
+            cidx = {c: i for i, c in enumerate(cols)}
+            if "id" not in cidx:
+                raise ValueError("'id' not found in ATOMS header")
+
+            # coordinate accessors: real (x,y,z) or scaled (xs,ys,zs)
+            if "x" in cidx:
+                get_x = lambda a: float(a[cidx["x"]])
+                get_y = (lambda a: float(a[cidx["y"]])) if "y" in cidx else (lambda a: None)
+                get_z = (lambda a: float(a[cidx["z"]])) if "z" in cidx else (lambda a: None)
+            elif "xs" in cidx:
+                s2r = lambda s, lo, hi: lo + float(s) * (hi - lo)
+                get_x = lambda a: s2r(a[cidx["xs"]], xlo, xhi)
+                get_y = (lambda a: s2r(a[cidx["ys"]], ylo, yhi)) if "ys" in cidx else (lambda a: None)
+                get_z = (lambda a: s2r(a[cidx["zs"]], zlo, zhi)) if "zs" in cidx else (lambda a: None)
+            else:
+                raise ValueError("No (x,y,z) or (xs,ys,zs) columns")
+
+            atoms = {}
+            while True:
+                pos = f.tell()
+                row = f.readline()
+                if (not row) or row.startswith("ITEM: "):
+                    if row:
+                        f.seek(pos)
+                    break
+                parts = row.split()
+                aid = int(parts[cidx["id"]])
+                atoms[aid] = (get_x(parts), get_y(parts), get_z(parts))
+
+            yield ts, (xlo, xhi, ylo, yhi, zlo, zhi), atoms
+
+
+# ----------------------------
+# Extract series for a set of ids (with nearest-image unwrap)
+# Returns lag-L displacements: Δ^{(L)}x_t = x_{t+L} - x_t
+# ----------------------------
+def extract_series_for_ids(path, ids, axis="x", lag_frames=1):
+    assert axis in ("x", "y", "z")
+    assert lag_frames >= 1
+    aidx = {"x": 0, "y": 1, "z": 2}[axis]
+
+    coord_per_frame = []  # list of dict: id -> coord
+    L_per_frame = []      # box length along axis
+
+    for ts, (xlo, xhi, ylo, yhi, zlo, zhi), atoms in parse_lammps_dump(path):
+        frame = {}
+        for aid in ids:
+            if aid in atoms:
+                val = atoms[aid][aidx]
+                if val is not None:
+                    frame[aid] = val
+        if frame:
+            L = (xhi - xlo) if aidx == 0 else (yhi - ylo) if aidx == 1 else (zhi - zlo)
+            coord_per_frame.append(frame)
+            L_per_frame.append(L)
+
+    if not coord_per_frame:
+        raise ValueError("No coordinates found for requested ids.")
+
+    # Build unwrapped trajectories per id
+    X = {aid: [] for aid in ids}
+    prev = {}
+
+    for frame, L in zip(coord_per_frame, L_per_frame):
+        for aid in ids:
+            if aid not in frame:
+                continue
+            x = frame[aid]
+            if aid not in prev:
+                prev[aid] = x
+                X[aid].append(x)
+            else:
+                dx = x - prev[aid]
+                if L > 0:
+                    if dx > 0.5 * L:
+                        dx -= L
+                    elif dx < -0.5 * L:
+                        dx += L
+                prev[aid] = prev[aid] + dx
+                X[aid].append(prev[aid])
+
+    # Convert to arrays and compute lag-L displacements
+    inc = {}
+    for aid, arr in X.items():
+        a = np.asarray(arr, float)
+        a = a[np.isfinite(a)]
+        if a.size >= (lag_frames + 1):
+            inc[aid] = a[lag_frames:] - a[:-lag_frames]
+
+    inc = {k: v for k, v in inc.items() if v.size > 0}
+    if not inc:
+        raise ValueError("No increments available for requested ids.")
+    return inc
+
+
+# ----------------------------
+# Smoothed PDF on a common grid (Gaussian-kernel via histogram convolution)
+# ----------------------------
+def smooth_pdf_on_common_grid(data_by_id, bins=800, prc=(0.5, 99.5), bandwidth=None):
+    pooled = np.concatenate([v for v in data_by_id.values() if v.size > 0])
+    pooled = pooled[np.isfinite(pooled)]
+    if pooled.size == 0:
+        raise ValueError("No finite data for PDF.")
+
+    xlo, xhi = np.percentile(pooled, prc)
+    if not np.isfinite(xlo) or not np.isfinite(xhi) or xlo == xhi:
+        xlo, xhi = pooled.min() - 1e-9, pooled.max() + 1e-9
+
+    edges = np.linspace(xlo, xhi, bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    dx = edges[1] - edges[0]
+
+    if bandwidth is None:
+        std = np.std(pooled)
+        n = pooled.size
+        bandwidth = 1.06 * std * (n ** (-1 / 5)) if n > 1 and std > 0 else dx * 2
+
+    sigma_bins = max(bandwidth / dx, 1e-6)
+    halfw = int(np.ceil(4 * sigma_bins))
+    kx = np.arange(-halfw, halfw + 1)
+    kernel = np.exp(-0.5 * (kx / sigma_bins) ** 2)
+    kernel /= kernel.sum()
+
+    densities = {}
+    for aid, arr in data_by_id.items():
+        arr = np.asarray(arr, float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        counts, _ = np.histogram(arr, bins=edges, density=False)
+        N = max(arr.size, 1)
+        dens = counts.astype(float) / (N * dx)
+        dens_s = np.convolve(dens, kernel, mode="same")
+        densities[aid] = dens_s
+
+    return centers, densities
+
+
+# ----------------------------
+# Plot
+# ----------------------------
+def plot_increment_pdfs(centers, densities_by_id, out="increments_pdfs.pdf", axis_label="x", xlim=None, title=None):
+    import itertools
+
+    palette = ["red", "orange", "green", "blue", "purple"]
+    color_cycle = itertools.cycle(palette)
+
+    plt.figure(figsize=(9.5, 6))
+
+    for aid in sorted(densities_by_id.keys()):
+        plt.plot(
+            centers,
+            densities_by_id[aid],
+            linewidth=2.0,
+            alpha=0.9,
+            color=next(color_cycle),
+            label=str(aid),
+        )
+
+    plt.xlabel(f"Δ{axis_label}", fontsize=30)
+    plt.ylabel("Probability density", fontsize=30)
+
+    if title is not None:
+        plt.title(title, fontsize=16)
+
+    plt.tick_params(axis="both", which="major", labelsize=22, length=7, width=1.2)
+    plt.tick_params(axis="both", which="minor", labelsize=22, length=4, width=1.0)
+    plt.minorticks_on()
+
+    if xlim is not None:
+        plt.xlim(xlim)
+
+    # plt.legend(ncol=2, fontsize=10)
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+    print(f"[saved] {out}")
+
+
+# ----------------------------
+# Normality tests & helpers
+# ----------------------------
+def ks_normal_pvalue(arr, ks_mode="fit"):
+    """
+    ks_mode:
+      - "fit": KS vs N(mean,std) estimated from the data (approximate p-value; Lilliefors caveat)
+      - "standard": KS vs N(0,1) (valid only if your data are standardized)
+    """
+    arr = np.asarray(arr, float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 20:
+        return np.inf, 0.0
+
+    if ks_mode == "standard":
+        return stats.kstest(arr, "norm", args=(0.0, 1.0))
+
+    mu = arr.mean()
+    sd = arr.std(ddof=0)
+    if sd <= 0:
+        return np.inf, 0.0
+    return stats.kstest(arr, "norm", args=(mu, sd))
+
+
+def run_jb_ks(inc_dict, ks_mode="fit"):
+    rows = []
+
+    pooled = np.concatenate([v for v in inc_dict.values() if v.size > 0])
+    pooled = pooled[np.isfinite(pooled)]
+    mu_p, sd_p = pooled.mean(), pooled.std(ddof=0)
+    jb_s, jb_p = stats.jarque_bera(pooled)
+
+    if ks_mode == "standard":
+        ks_s, ks_p = stats.kstest(pooled, "norm", args=(0.0, 1.0))
+    else:
+        ks_s, ks_p = stats.kstest(pooled, "norm", args=(mu_p, sd_p)) if sd_p > 0 else (np.inf, 0.0)
+
+    rows.append(["pooled", pooled.size, mu_p, sd_p, jb_s, jb_p, ks_s, ks_p])
+
+    for aid in sorted(inc_dict.keys()):
+        arr = np.asarray(inc_dict[aid], float)
+        arr = arr[np.isfinite(arr)]
+        mu, sd = arr.mean(), arr.std(ddof=0)
+        jb_s, jb_p = stats.jarque_bera(arr)
+        ks_s, ks_p = ks_normal_pvalue(arr, ks_mode=ks_mode)
+        rows.append([aid, arr.size, mu, sd, jb_s, jb_p, ks_s, ks_p])
+
+    return rows
+
+
+def save_tests_csv(rows, path="jb_ks_results.csv"):
+    header = ["series", "n", "mean", "std", "JB_stat", "JB_p", "KS_stat", "KS_p"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    print(f"[saved] {path}")
+
+
+def save_per_id_flags(rows, path="jb_ks_per_id_flags.csv", alpha=0.01):
+    header = ["id", "n", "mean", "std", "JB_p", "KS_p", "JB_pass", "KS_pass", "Both_pass"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            series, n, mean, std, jb_s, jb_p, ks_s, ks_p = r
+            if series == "pooled":
+                continue
+            jb_pass = (jb_p is not None and jb_p >= alpha)
+            ks_pass = (ks_p is not None and ks_p >= alpha)
+            both_pass = jb_pass and ks_pass
+            w.writerow([series, n, mean, std, jb_p, ks_p, int(jb_pass), int(ks_pass), int(both_pass)])
+    print(f"[saved] {path}")
+
+
+def find_gaussian_ids(inc_dict, alpha=0.05, ks_mode="fit", pass_mode="both", min_n=20):
+    """
+    pass_mode:
+      - "both": require JB_p>=alpha AND KS_p>=alpha
+      - "jb":   require JB_p>=alpha only
+      - "ks":   require KS_p>=alpha only
+    Returns:
+      gaussian_ids: list[int]
+      per_id_pvals: dict[id] = (n, JB_p, KS_p)
+    """
+    gaussian_ids = []
+    per_id_pvals = {}
+
+    for aid in sorted(inc_dict.keys()):
+        arr = np.asarray(inc_dict[aid], float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < min_n:
+            continue
+
+        jb_stat, jb_p = stats.jarque_bera(arr)
+        ks_stat, ks_p = ks_normal_pvalue(arr, ks_mode=ks_mode)
+
+        per_id_pvals[aid] = (int(arr.size), float(jb_p), float(ks_p))
+
+        jb_ok = (jb_p >= alpha)
+        ks_ok = (ks_p >= alpha)
+
+        if pass_mode == "jb" and jb_ok:
+            gaussian_ids.append(aid)
+        elif pass_mode == "ks" and ks_ok:
+            gaussian_ids.append(aid)
+        elif pass_mode == "both" and (jb_ok and ks_ok):
+            gaussian_ids.append(aid)
+
+    return gaussian_ids, per_id_pvals
+
+
+# ----------------------------
+# Driver
+# ----------------------------
+def run(args):
+    ids = list(range(args.id_start, args.id_end + 1))
+    print(f"[*] Extracting displacements (lag={args.lag_frames}) for ids {ids[0]}–{ids[-1]} "
+          f"on axis={args.axis} from {args.dump}")
+
+    inc = extract_series_for_ids(args.dump, ids=ids, axis=args.axis, lag_frames=args.lag_frames)
+
+    # drop ids with very few samples
+    inc = {k: v for k, v in inc.items() if v.size >= max(50, args.min_points)}
+    print("    counts per id:", {k: len(v) for k, v in inc.items()})
+    if not inc:
+        raise ValueError("No qualifying ids after filtering.")
+
+    # Save tests/flags (original behavior)
+    rows = run_jb_ks(inc, ks_mode=args.ks_mode)
+    save_tests_csv(rows, path=f"jb_ks_results_L{args.lag_frames}.csv")
+    save_per_id_flags(rows, path=f"jb_ks_per_id_flags_L{args.lag_frames}.csv", alpha=args.alpha)
+
+    # NEW: find gaussian particle ids + print them
+    gaussian_ids, per_id_pvals = find_gaussian_ids(
+        inc, alpha=args.alpha, ks_mode=args.ks_mode, pass_mode=args.pass_mode, min_n=20
+    )
+
+    print(f"\n[Gaussian IDs @ α={args.alpha} | KS mode: {args.ks_mode} | pass_mode: {args.pass_mode}]")
+    print(f"  Total considered (after filters): {len(inc)}")
+    print(f"  Gaussian (pass): {len(gaussian_ids)}")
+    if len(gaussian_ids) > 0:
+        print("  Particle IDs that PASS:")
+        # print in chunks so it’s readable
+        chunk = 25
+        for i in range(0, len(gaussian_ids), chunk):
+            print("   ", gaussian_ids[i:i + chunk])
+    else:
+        print("  (none)")
+
+    # OPTIONAL: write gaussian ids to a text file
+    if args.save_gaussian_ids is not None:
+        with open(args.save_gaussian_ids, "w") as f:
+            for aid in gaussian_ids:
+                n, jb_p, ks_p = per_id_pvals[aid]
+                f.write(f"{aid}\t{n}\t{jb_p:.6g}\t{ks_p:.6g}\n")
+        print(f"[saved] {args.save_gaussian_ids} (id, n, JB_p, KS_p)")
+
+    # Plot PDFs for ALL particles (original plot) if requested
+    if args.plot_all:
+        x_all, dens_all = smooth_pdf_on_common_grid(
+            inc, bins=args.bins, prc=(args.prc_lo, args.prc_hi), bandwidth=args.bandwidth
+        )
+        out_all = f"increments_pdfs_ALL_ids{args.id_start}-{args.id_end}_{args.axis}_L{args.lag_frames}.pdf"
+        plot_increment_pdfs(x_all, dens_all, out=out_all, axis_label=args.axis, xlim=args.xlim,
+                            title="All particles (after filters)")
+
+    # NEW: Plot PDFs ONLY for Gaussian particles
+    if len(gaussian_ids) > 0:
+        inc_gauss = {aid: inc[aid] for aid in gaussian_ids}
+        x_g, dens_g = smooth_pdf_on_common_grid(
+            inc_gauss, bins=args.bins, prc=(args.prc_lo, args.prc_hi), bandwidth=args.bandwidth
+        )
+        out_g = f"increments_pdfs_GAUSSIAN_only_ids{args.id_start}-{args.id_end}_{args.axis}_L{args.lag_frames}.pdf"
+        plot_increment_pdfs(x_g, dens_g, out=out_g, axis_label=args.axis, xlim=args.xlim,
+                            title=f"Gaussian particles only (pass_mode={args.pass_mode}, α={args.alpha})")
+    else:
+        print("[!] No Gaussian particles to plot.")
+
+
+# ----------------------------
+# Entry
+# ----------------------------
+if __name__ == "__main__":
+    import sys
+
+    in_ipykernel = ("ipykernel" in sys.argv[0]) or any(a.startswith("-f") for a in sys.argv[1:])
+
+    if in_ipykernel:
+        class Args:
+            pass
+
+        args = Args()
+        args.dump = "dump.lammpstrj"
+        args.axis = "x"
+        args.id_start = 2501
+        args.id_end = 5000
+        args.bins = 1500
+        args.prc_lo = 0.5
+        args.prc_hi = 99.5
+        args.bandwidth = None
+        args.min_points = 50
+        args.lag_frames = 5
+        args.alpha = 0.05
+        args.ks_mode = "fit"            # "fit" (approx) or "standard" (vs N(0,1))
+        args.pass_mode = "both"         # NEW: "both", "jb", or "ks"
+        args.xlim = None                # set None for auto (recommended)
+        args.plot_all = False           # NEW: plot all particles too?
+        args.save_gaussian_ids = "gaussian_ids.txt"  # NEW: or None
+        run(args)
+
+    else:
+        p = argparse.ArgumentParser(description="Increment/displacement PDFs + JB/KS Gaussianity for ids in a range")
+        p.add_argument("dump", help="Path to LAMMPS dump file")
+        p.add_argument("--axis", type=str, default="x", choices=["x", "y", "z"])
+        p.add_argument("--id_start", type=int, default=2501)
+        p.add_argument("--id_end", type=int, default=5000)
+        p.add_argument("--bins", type=int, default=1000, help="Common grid bins")
+        p.add_argument("--prc_lo", type=float, default=0.5, help="Lower percentile for x-range")
+        p.add_argument("--prc_hi", type=float, default=99.5, help="Upper percentile for x-range")
+        p.add_argument("--bandwidth", type=float, default=None,
+                       help="Gaussian KDE bandwidth (data units). Default: Silverman rule.")
+        p.add_argument("--min_points", type=int, default=50, help="Drop ids with too-few increments")
+        p.add_argument("--lag_frames", type=int, default=2,
+                       help="Frame lag L for displacements: Δ = x[t+L]-x[t].")
+        p.add_argument("--alpha", type=float, default=0.01, help="Significance level for pass/fail (default 0.01).")
+        p.add_argument("--ks_mode", choices=["fit", "standard"], default="fit",
+                       help="KS mode: 'fit' uses fitted mean/std (approx p); 'standard' tests vs N(0,1).")
+
+        # NEW: choose what "Gaussian" means
+        p.add_argument("--pass_mode", choices=["both", "jb", "ks"], default="both",
+                       help="Which criterion counts as Gaussian: both tests pass, or only JB, or only KS.")
+
+        # NEW: optional plot all + save gaussian IDs
+        p.add_argument("--plot_all", action="store_true", help="Also plot PDFs for ALL particles (not just Gaussian).")
+        p.add_argument("--save_gaussian_ids", type=str, default=None,
+                       help="Write gaussian IDs (id, n, JB_p, KS_p) to this file. Example: gaussian_ids.txt")
+
+        # Plot xlim: default None (auto). If you want manual, pass two numbers.
+        p.add_argument("--xlim", type=float, nargs=2, default=None,
+                       help="x-axis limits for PDF plot, e.g. --xlim -5 5. Default: auto.")
+
+        args = p.parse_args()
+        run(args)
